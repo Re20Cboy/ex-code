@@ -1,4 +1,10 @@
-"""Mock LLM - 用于测试"""
+"""Mock LLM - 用于测试
+
+包含两种实现:
+- MockLLM: 快速模拟（微秒级延迟），用于功能验证
+- RealisticMockLLM: 真实延迟模拟（秒级），用于延迟分析实验
+"""
+import math
 import random
 import time
 from typing import Dict, Tuple
@@ -168,3 +174,84 @@ class MockLLM(BaseLLM):
             # 验证过程出错，保守策略：默认通过
             print(f"[验证] 验证过程出错: {e}")
             return True
+
+
+class RealisticMockLLM(BaseLLM):
+    """
+    带有真实 LLM API 延迟分布的 Mock LLM
+
+    使用对数正态分布 (log-normal) 模拟真实 LLM API 调用延迟，
+    该分布是典型 API 响应时间的统计特征。
+
+    延迟档位基于真实 LLM API 测量数据:
+    - fast:   GLM-4-flash, DeepSeek-chat 等轻量模型
+    - medium: GPT-3.5-turbo, Qwen-turbo 等标准模型
+    - slow:   GPT-4, Qwen-max 等重度模型
+
+    Args:
+        accuracy: 答案准确率 (0.0-1.0)
+        profile:  延迟档位 "fast" | "medium" | "slow"
+    """
+
+    # (generate_mean, generate_cv, validate_mean, validate_cv)
+    # cv = coefficient of variation (变异系数)
+    PROFILES = {
+        "fast":   (0.8,  0.30, 0.4, 0.30),   # GLM-4-flash 级别
+        "medium": (2.2,  0.35, 0.9, 0.30),   # GPT-3.5-turbo 级别
+        "slow":   (4.5,  0.35, 1.8, 0.35),   # GPT-4 级别
+    }
+
+    def __init__(self, accuracy: float = 1.0, profile: str = "medium"):
+        self.accuracy = accuracy
+        p = self.PROFILES.get(profile, self.PROFILES["medium"])
+        self.gen_mu, self.gen_cv, self.val_mu, self.val_cv = p
+        # 复用 MockLLM 的数学求解逻辑
+        self._solver = MockLLM(accuracy=1.0)
+
+    def _realistic_delay(self, mu: float, cv: float) -> float:
+        """
+        使用对数正态分布生成真实感延迟
+
+        Log-normal 分布特性:
+        - 右偏: 大多数请求较快，少数请求较慢（符合 API 实际表现）
+        - E[X] ≈ mu (均值约等于目标延迟)
+        - 偶尔出现长尾延迟（模拟网络抖动/排队）
+        """
+        sigma = math.sqrt(math.log(1 + cv * cv))  # 对数正态的 sigma 参数
+        mu_log = math.log(mu) - sigma * sigma / 2  # 对数正态的 mu 参数
+        delay = random.lognormvariate(mu_log, sigma)
+        # 截断: 最低 0.05s, 最高 5x 均值（模拟极端但不过分的延迟）
+        return max(0.05, min(delay, mu * 5))
+
+    def generate(self, question: str) -> Tuple[list, str]:
+        # 模拟真实 LLM 生成延迟
+        delay = self._realistic_delay(self.gen_mu, self.gen_cv)
+        time.sleep(delay)
+
+        # 复用 MockLLM 的数学求解（不走它的 sleep）
+        reasoning, answer = self._solver._solve_math(question)
+
+        # 按准确率随机引入错误
+        if random.random() > self.accuracy:
+            try:
+                answer = str(int(float(answer)) + random.randint(1, 10))
+            except ValueError:
+                answer = str(random.randint(1, 100))
+
+        steps = [
+            "步骤1: 分析问题",
+            f"步骤2: {reasoning}",
+            f"步骤3: 得出答案 {answer}",
+        ]
+        return steps, answer
+
+    def validate(self, proposal: Dict) -> str:
+        # 模拟真实 LLM 验证延迟
+        delay = self._realistic_delay(self.val_mu, self.val_cv)
+        time.sleep(delay)
+
+        # 复用 MockLLM 的验证逻辑
+        return self._solver.validate(proposal)
+
+    def health_check(self) -> bool:
+        return True

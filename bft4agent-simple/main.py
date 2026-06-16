@@ -2,16 +2,24 @@
 BFT4Agent Demo - 主入口
 
 快速演示BFT4Agentconsensus流程
+集成 DID 身份系统、信誉系统、行为日志、激励层
 """
 
 import sys
 import time
+import json
 from config import load_config
 from agents import create_agents
 from network import Network
 from consensus import BFT4Agent
 from llm_new import LLMCaller
 from tasks import TaskLoader
+
+# 新增模块
+from did_registry import DIDRegistry
+from behavior_log import BehaviorLog
+from reputation import ReputationSystem
+from incentive import IncentiveSystem
 
 
 def print_header(title: str):
@@ -30,29 +38,78 @@ def print_config(config):
     print(f"networkdelay: {config['network_delay']} ms")
     print(f"法定人数比例: {config['quorum_ratio']:.1%}")
 
+    # 新增配置
+    did_cfg = config.get("did", {})
+    rep_cfg = config.get("reputation", {})
+    inc_cfg = config.get("incentive", {})
+    wv_cfg = config.get("weighted_voting", {})
+
+    print(f"DID系统: {'启用' if did_cfg.get('enabled') else '禁用'}")
+    print(f"信誉系统: {'启用' if rep_cfg.get('enabled') else '禁用'}")
+    print(f"激励系统: {'启用' if inc_cfg.get('enabled') else '禁用'}")
+    print(f"加权投票: {'启用' if wv_cfg.get('enabled') else '禁用'}")
+
 
 def main():
     """主函数"""
-    print_header("BFT4Agent Demo - 简化原型")
+    print_header("BFT4Agent v2.0 - 集成DID/信誉/激励层")
 
     # 加载config
     config = load_config()
     print_config(config)
 
-    # 创建LLM
+    # ========== 1. 初始化 DID / 信誉 / 行为日志 / 激励系统 ==========
+    did_cfg = config.get("did", {})
+    rep_cfg = config.get("reputation", {})
+    inc_cfg = config.get("incentive", {})
+    wv_cfg = config.get("weighted_voting", {})
+
+    # DID 注册表
+    did_registry = None
+    if did_cfg.get("enabled", True):
+        did_registry = DIDRegistry(min_stake=did_cfg.get("min_stake", 100.0))
+        print(f"\n[init] DID注册表已创建 (最低质押: {did_cfg.get('min_stake', 100.0)})")
+
+    # 行为日志
+    behavior_log = BehaviorLog()
+    print(f"[init] 行为日志系统已创建")
+
+    # 信誉系统
+    reputation_system = None
+    if rep_cfg.get("enabled", True):
+        reputation_system = ReputationSystem(
+            did_registry=did_registry,
+            behavior_log=behavior_log,
+            alpha=rep_cfg.get("alpha", 0.05),
+            beta=rep_cfg.get("beta", 0.3),
+            decay_factor=rep_cfg.get("decay_factor", 0.995),
+            suspend_threshold=rep_cfg.get("suspend_threshold", 0.3),
+            revoke_threshold=rep_cfg.get("revoke_threshold", 0.1),
+        )
+        print(f"[init] 信誉系统已创建 (alpha={rep_cfg.get('alpha', 0.05)}, beta={rep_cfg.get('beta', 0.3)})")
+
+    # 激励系统
+    incentive_system = None
+    if inc_cfg.get("enabled", True):
+        incentive_system = IncentiveSystem(
+            did_registry=did_registry,
+            reputation_system=reputation_system,
+            behavior_log=behavior_log,
+            initial_pool=inc_cfg.get("initial_pool", 10000.0),
+        )
+        print(f"[init] 激励系统已创建 (初始池: {inc_cfg.get('initial_pool', 10000.0)})")
+
+    # ========== 2. 创建 LLM ==========
     print(f"\n[init] 创建LLM ({config['llm_backend']})...")
 
-    # 准备LLM配置参数
     backend = config["llm_backend"]
     llm_kwargs = {}
 
     if backend == "mock":
         llm_kwargs["accuracy"] = config.get("mock_accuracy", 0.85)
     else:
-        # 从配置中获取对应后端的API配置
         api_config = config.get("llm_api_config", {}).get(backend, {})
         if api_config:
-            # 根据不同后端添加不同的配置参数
             if backend == "openai":
                 llm_kwargs["api_key"] = api_config.get("api_key", "")
                 if api_config.get("base_url"):
@@ -75,17 +132,15 @@ def main():
                 llm_kwargs["model"] = api_config.get("model", "custom-model")
 
             elif backend in ["tongyi", "wenxin", "xunfei", "claude"]:
-                # 其他后端的配置参数
                 for key, value in api_config.items():
                     llm_kwargs[key] = value
 
     llm = LLMCaller(backend=backend, **llm_kwargs)
 
-    # 创建Agent
+    # ========== 3. 创建 Agent（集成 DID 注册）==========
     num_malicious = int(config["num_agents"] * config["malicious_ratio"])
-    print(f"[init] 创建 {config['num_agents']} 个Agent ({num_malicious} 个malicious)...")
+    print(f"\n[init] 创建 {config['num_agents']} 个Agent ({num_malicious} 个malicious)...")
 
-    # 获取角色配置
     role_configs = config.get("agent_roles", [])
     random_assignment = config.get("assign_roles_randomly", True)
 
@@ -95,36 +150,48 @@ def main():
         llm_caller=llm,
         role_configs=role_configs,
         random_assignment=random_assignment,
+        did_registry=did_registry,
+        behavior_log=behavior_log,
+        stake_amount=did_cfg.get("stake_amount", 200.0),
     )
 
-    # 打印Agent信息
-    print("\n=== Agent列表 ===")
+    # 初始化信誉系统
+    if reputation_system:
+        reputation_system.initialize(agents)
+
+    # 打印Agent信息（增强版）
+    print("\n=== Agent列表（含DID和信誉）===")
     for agent in agents:
         malicious_flag = " [malicious]" if agent.is_malicious else ""
         specialty_name = agent.role_config.get("name", "通用")
         specialty = f"- {specialty_name}" if agent.role_config else ""
-        print(f"  {agent.id}: {specialty}, rep={agent.reputation:.2f}{malicious_flag}")
+        did_str = agent.did if agent.did else "无DID"
+        print(f"  {agent.id}: {specialty}, rep={agent.reputation:.2f}, weight={agent.voting_weight:.3f}, did={did_str}{malicious_flag}")
 
-    # 创建network
+    # ========== 4. 创建网络 ==========
     print(f"\n[init] 创建P2Pnetwork...")
     network = Network(
         delay_range=config["network_delay"], packet_loss=config.get("packet_loss", 0.01)
     )
 
-    # registernode
     for agent in agents:
         network.register(agent)
 
-    # 创建BFT实例
-    print(f"[init] initBFT4Agent协议...")
+    # ========== 5. 创建 BFT 实例（集成所有新模块）==========
+    print(f"[init] initBFT4Agent协议（集成DID/信誉/激励）...")
     bft = BFT4Agent(
         agents=agents,
         network=network,
         timeout=config["timeout"],
         max_retries=config["max_retries"],
+        did_registry=did_registry,
+        reputation_system=reputation_system,
+        behavior_log=behavior_log,
+        incentive_system=incentive_system,
+        enable_weighted_voting=wv_cfg.get("enabled", True),
     )
 
-    # 加载任务
+    # ========== 6. 加载任务 ==========
     print_header("加载任务")
 
     try:
@@ -133,14 +200,13 @@ def main():
     except Exception as e:
         print(f"\n[ERROR] 任务加载失败: {e}")
         print("\n[INFO] 使用默认任务（向后兼容）")
-        # 向后兼容：如果加载失败，使用默认任务
         tasks = [
-            {"content": "2 + 2 = ?", "type": "math"},
-            {"content": "23 * 47 = ?", "type": "math"},
-            {"content": "144 / 12 = ?", "type": "math"},
+            {"content": "2 + 2 = ?", "type": "math", "answer": "4"},
+            {"content": "23 * 47 = ?", "type": "math", "answer": "1081"},
+            {"content": "144 / 12 = ?", "type": "math", "answer": "12"},
         ]
 
-    # 运行示例task
+    # ========== 7. 运行共识 ==========
     print_header("开始共识流程")
 
     results = []
@@ -153,10 +219,14 @@ def main():
         result = bft.run(task)
         results.append(result)
 
-        time.sleep(0.1)  # task间暂停
+        # 同步信誉到 Agent
+        if reputation_system:
+            reputation_system.sync_to_agents(agents)
 
-    # statsresult
-    print_header("experimentresultstats")
+        time.sleep(0.1)
+
+    # ========== 8. 输出完整报告 ==========
+    print_header("实验结果统计")
 
     success_count = sum(1 for r in results if r["success"])
     total_time = sum(r["total_time"] for r in results)
@@ -169,20 +239,79 @@ def main():
     print(f"平均time: {total_time/len(results):.2f}秒")
     print(f"总viewchange: {total_view_changes}次")
 
-    # BFTstats
+    # BFT 统计
     stats = bft.get_stats()
     print(f"\n=== BFT协议stats ===")
     for key, value in stats.items():
         print(f"{key}: {value}")
 
-    # networkstats
+    # 网络统计
     net_stats = network.get_stats()
     print(f"\n=== networkstats ===")
     for key, value in net_stats.items():
         print(f"{key}: {value}")
 
+    # DID 统计
+    if did_registry:
+        print(f"\n=== DID注册表统计 ===")
+        did_stats = did_registry.get_stats()
+        for k, v in did_stats.items():
+            print(f"  {k}: {v}")
+
+    # 信誉统计
+    if reputation_system:
+        print(f"\n=== 信誉系统统计 ===")
+        rep_stats = reputation_system.get_stats()
+        for k, v in rep_stats.items():
+            print(f"  {k}: {v}")
+
+        # 打印每个 Agent 的信誉和权重
+        print(f"\n=== Agent信誉与权重 ===")
+        for agent in agents:
+            level = ReputationSystem.get_reputation_level(agent.reputation).value
+            print(f"  {agent.id}: rep={agent.reputation:.4f} ({level}), weight={agent.voting_weight:.4f}, "
+                  f"tasks={agent.tasks_participated}, success={agent.tasks_success}")
+
+    # 激励统计
+    if incentive_system:
+        print(f"\n=== 激励系统统计 ===")
+        inc_stats = incentive_system.get_stats()
+        for k, v in inc_stats.items():
+            print(f"  {k}: {v}")
+
+        # 排行榜
+        print(f"\n=== 贡献度排行榜 ===")
+        lb = incentive_system.get_leaderboard()
+        for rank, entry in enumerate(lb, 1):
+            print(f"  #{rank} {entry['agent_id']}: score={entry['contribution_score']:.3f}, "
+                  f"balance={entry['balance']:.2f}, rep={entry['reputation']:.4f}")
+
+    # 行为日志统计
+    if behavior_log:
+        print(f"\n=== 行为日志统计 ===")
+        bl_stats = behavior_log.get_stats()
+        for k, v in bl_stats.items():
+            print(f"  {k}: {v}")
+
+        # 可疑行为检测
+        print(f"\n=== 可疑行为检测 ===")
+        for agent in agents:
+            patterns = behavior_log.detect_suspicious_patterns(agent.id)
+            if patterns["suspicions"]:
+                print(f"  {agent.id}: suspicion_score={patterns['suspicion_score']:.2f}")
+                for s in patterns["suspicions"]:
+                    print(f"    [{s['severity']}] {s['description']}")
+
+    # DID 注册表快照
+    if did_registry:
+        print(f"\n=== DID注册表快照 ===")
+        snapshot = did_registry.get_registry_snapshot()
+        for doc in snapshot:
+            print(f"  {doc['did']}: status={doc['status']}, stake={doc['stake_amount']:.2f}, "
+                  f"credentials={len(doc['credentials'])}")
+
     print("\n" + "=" * 60)
-    print("  Democomplete!")
+    print("  Demo complete!")
     print("=" * 60)
 
     return results

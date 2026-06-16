@@ -7,6 +7,13 @@
 - COMMIT: 收到2f条prepare后广播commit，收集2f+1条commit后执行
 
 包含视图更换机制处理主节点故障
+
+v2.0 新增:
+- DID 身份验证（参与共识前验证身份有效性）
+- 加权投票（基于信誉的投票权重）
+- 行为日志记录（全流程行为追踪）
+- 信誉系统集成（共识后自动更新信誉）
+- 激励分配（共识后自动分配奖惩）
 """
 
 import time
@@ -16,6 +23,8 @@ import threading
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 from dataclasses import dataclass, field
+
+from behavior_log import BehaviorEventType
 
 
 class ReplicaState(Enum):
@@ -195,6 +204,11 @@ class BFT4Agent:
         f: Optional[int] = None,
         timeout: float = 5.0,
         max_retries: int = 3,
+        did_registry=None,
+        reputation_system=None,
+        behavior_log=None,
+        incentive_system=None,
+        enable_weighted_voting: bool = True,
     ):
         """
         初始化PBFT协议
@@ -205,11 +219,23 @@ class BFT4Agent:
             f: 最大容忍故障节点数（默认为总节点数的1/4向下取整）
             timeout: 超时时间（秒）
             max_retries: 最大重试次数
+            did_registry: DID注册表（可选，用于身份验证）
+            reputation_system: 信誉系统（可选，用于加权投票）
+            behavior_log: 行为日志（可选，用于行为追踪）
+            incentive_system: 激励系统（可选，用于奖惩分配）
+            enable_weighted_voting: 是否启用加权投票
         """
         self.agents = agents
         self.network = network
         self.timeout = timeout
         self.max_retries = max_retries
+
+        # === DID / 信誉 / 行为日志 / 激励系统 ===
+        self.did_registry = did_registry
+        self.reputation_system = reputation_system
+        self.behavior_log = behavior_log
+        self.incentive_system = incentive_system
+        self.enable_weighted_voting = enable_weighted_voting
 
         # PBFT参数
         self.total_nodes = len(agents)
@@ -317,6 +343,7 @@ class BFT4Agent:
         view_changes = 0
         message_count = 0
         phases_completed = []
+        phase_times = {}  # 各阶段耗时记录
 
         print(f"\n{'='*60}")
         print(f"  开始BFT4Agent共识 - {task['content']}")
@@ -342,7 +369,9 @@ class BFT4Agent:
                 # === PHASE 1: PRE-PREPARE ===
                 # Leader生成proposal并广播
                 print(f"\n[阶段1] PRE-PREPARE - Leader生成提案")
+                t_phase = time.time()
                 pre_prepare_msg = self._pre_prepare_phase(primary_id, task)
+                phase_times["pre_prepare"] = time.time() - t_phase
                 if not pre_prepare_msg:
                     raise Exception("PRE-PREPARE阶段失败")
 
@@ -352,7 +381,9 @@ class BFT4Agent:
                 # === PHASE 2: PREPARE ===
                 # Backup节点对proposal进行Y/N评价
                 print(f"\n[阶段2] PREPARE - Backup节点评价提案")
+                t_phase = time.time()
                 prepare_success, prepare_decision = self._prepare_phase(pre_prepare_msg)
+                phase_times["prepare"] = time.time() - t_phase
                 if not prepare_success:
                     raise Exception("PREPARE阶段超时或未达到法定人数")
 
@@ -367,7 +398,9 @@ class BFT4Agent:
                 # === PHASE 3: COMMIT ===
                 # 所有节点对Y/N达成最终共识
                 print(f"\n[阶段3] COMMIT - 对Y/N达成最终共识")
+                t_phase = time.time()
                 commit_success, final_decision = self._commit_phase(pre_prepare_msg, prepare_decision)
+                phase_times["commit"] = time.time() - t_phase
                 if not commit_success:
                     raise Exception("COMMIT阶段超时或未达到法定人数")
 
@@ -395,7 +428,15 @@ class BFT4Agent:
                     "primary_id": primary_id,
                     "sequence_number": pre_prepare_msg.sequence_number,
                     "decision": final_decision,  # "Y" or "N"
+                    "phase_times": dict(phase_times),
                 }
+
+                # === 信誉更新、行为日志、激励分配 ===
+                self._post_consensus_processing(
+                    task=task,
+                    result=result,
+                    pre_prepare_msg=pre_prepare_msg,
+                )
 
                 print(f"\n{'='*60}")
                 print(f"  [OK] BFT4Agent共识成功!")
@@ -433,6 +474,7 @@ class BFT4Agent:
             "error": "Max retries exceeded",
             "phases": phases_completed,
             "decision": "N",
+            "phase_times": dict(phase_times),
         }
 
     def _pre_prepare_phase(self, primary_id: str, task: Dict) -> Optional[PrePrepareMessage]:
@@ -563,39 +605,71 @@ class BFT4Agent:
         # 等待所有副本处理接收到的PREPARE消息
         time.sleep(0.5)
 
-        # === 核心修改：统计Y/N投票数量 ===
-        y_count = 0
-        n_count = 0
-        for prep_msg in prepare_messages:
-            if prep_msg.decision == "Y":
-                y_count += 1
-            elif prep_msg.decision == "N":
-                n_count += 1
+        # === 核心修改：统计Y/N投票数量（支持加权投票）===
+        if self.enable_weighted_voting and self.reputation_system:
+            # 加权投票模式：使用信誉权重
+            y_weight = 0.0
+            n_weight = 0.0
+            total_weight = 0.0
+            weights = self.reputation_system.compute_all_weights()
 
-        print(f"[PREPARE] 投票统计: Y={y_count}, N={n_count}")
+            for prep_msg in prepare_messages:
+                w = weights.get(prep_msg.sender_id, 0.0)
+                total_weight += w
+                if prep_msg.decision == "Y":
+                    y_weight += w
+                elif prep_msg.decision == "N":
+                    n_weight += w
 
-        # 检查是否达到法定人数要求
-        # 根据BFT4Agent设计：
-        # - 如果Y >= 2f+1，则接受proposal
-        # - 如果N >= f+1，则拒绝proposal
-        prepared_count = 0
-        consensus_decision = ""
+            y_count = sum(1 for m in prepare_messages if m.decision == "Y")
+            n_count = sum(1 for m in prepare_messages if m.decision == "N")
 
-        if y_count >= self.quorum_size:
-            # Y达到法定人数，接受proposal
-            prepared_count = self.total_nodes
-            consensus_decision = "Y"
-            print(f"[PREPARE] 达到Y法定人数 ({y_count} >= {self.quorum_size})，接受proposal")
-        elif n_count >= (self.f + 1):
-            # N达到阈值，拒绝proposal
-            consensus_decision = "N"
-            print(f"[PREPARE] 达到N阈值 ({n_count} >= {self.f + 1})，拒绝proposal")
-            # 注意：这里仍然返回True表示达成了"拒绝"的共识，但在run()中会触发视图切换
-            return (True, consensus_decision)
+            print(f"[PREPARE] 加权投票统计: Y={y_count}(权重={y_weight:.3f}), N={n_count}(权重={n_weight:.3f}), 总权重={total_weight:.3f}")
+
+            # 加权法定人数检查
+            # Y权重 >= 2/3 总权重 → 接受
+            # N权重 >= 1/3 总权重 → 拒绝
+            prepared_count = 0
+            consensus_decision = ""
+
+            if total_weight > 0 and y_weight >= (2.0/3.0) * total_weight:
+                prepared_count = self.total_nodes
+                consensus_decision = "Y"
+                print(f"[PREPARE] 达到Y加权法定人数 ({y_weight:.3f} >= {2.0/3.0 * total_weight:.3f})，接受proposal")
+            elif total_weight > 0 and n_weight >= (1.0/3.0) * total_weight:
+                consensus_decision = "N"
+                print(f"[PREPARE] 达到N加权阈值 ({n_weight:.3f} >= {1.0/3.0 * total_weight:.3f})，拒绝proposal")
+                return (True, consensus_decision)
+            else:
+                print(f"[PREPARE] 未达成加权共识 (Y权重={y_weight:.3f}, N权重={n_weight:.3f})")
+                return (False, "")
         else:
-            # 未达成共识
-            print(f"[PREPARE] 未达成共识 (Y={y_count}, N={n_count})")
-            return (False, "")
+            # 传统模式：一人一票
+            y_count = 0
+            n_count = 0
+            for prep_msg in prepare_messages:
+                if prep_msg.decision == "Y":
+                    y_count += 1
+                elif prep_msg.decision == "N":
+                    n_count += 1
+
+            print(f"[PREPARE] 投票统计: Y={y_count}, N={n_count}")
+
+            # 检查是否达到法定人数要求
+            prepared_count = 0
+            consensus_decision = ""
+
+            if y_count >= self.quorum_size:
+                prepared_count = self.total_nodes
+                consensus_decision = "Y"
+                print(f"[PREPARE] 达到Y法定人数 ({y_count} >= {self.quorum_size})，接受proposal")
+            elif n_count >= (self.f + 1):
+                consensus_decision = "N"
+                print(f"[PREPARE] 达到N阈值 ({n_count} >= {self.f + 1})，拒绝proposal")
+                return (True, consensus_decision)
+            else:
+                print(f"[PREPARE] 未达成共识 (Y={y_count}, N={n_count})")
+                return (False, "")
 
         # 更新所有副本状态
         for replica in self.replicas.values():
@@ -629,6 +703,23 @@ class BFT4Agent:
         proposal = pre_prepare_msg.proposal
         print(f"[{replica.agent.id}] 正在评价proposal...")
 
+        # === DID 身份验证 ===
+        if self.did_registry and replica.agent.did:
+            valid, reason_msg = self.did_registry.verify_identity(replica.agent.did)
+            if not valid:
+                print(f"[{replica.agent.id}] DID身份验证失败: {reason_msg}，跳过投票")
+                # 记录行为日志
+                if self.behavior_log and replica.agent.did:
+                    self.behavior_log.record(
+                        agent_id=replica.agent.id,
+                        did=replica.agent.did,
+                        event_type=BehaviorEventType.TIMEOUT if "暂停" in reason_msg else BehaviorEventType.OFFLINE,
+                        task_id=proposal.get("task_id", ""),
+                        view=self.current_view,
+                        details={"reason": f"DID验证失败: {reason_msg}"},
+                    )
+                return
+
         # 调用agent的validate方法获取Y/N决策
         vote = replica.agent.validate(proposal)
         decision = vote.get("decision", "N")  # Y or N
@@ -636,6 +727,19 @@ class BFT4Agent:
         reason = vote.get("reason", "")
 
         print(f"[{replica.agent.id}] 评价结果: {decision} (置信度: {confidence:.2f})")
+
+        # === 记录行为日志 ===
+        if self.behavior_log and replica.agent.did:
+            self.behavior_log.record_vote(
+                agent_id=replica.agent.id,
+                did=replica.agent.did,
+                task_id=proposal.get("task_id", ""),
+                view=self.current_view,
+                seq=pre_prepare_msg.sequence_number,
+                decision=decision,
+                confidence=confidence,
+                reason=reason,
+            )
 
         # 创建PREPARE消息，包含Y/N评价
         prepare_msg = PrepareMessage(
@@ -859,6 +963,106 @@ class BFT4Agent:
         for replica in self.replicas.values():
             replica.is_primary = False
             replica.state = ReplicaState.IDLE
+
+    def _post_consensus_processing(
+        self,
+        task: Dict,
+        result: Dict,
+        pre_prepare_msg,
+    ):
+        """
+        共识完成后的后处理
+
+        执行：
+        1. 更新所有节点的信誉分数
+        2. 分配激励奖励
+        3. 同步信誉/权重到 Agent 对象
+        4. 颁发新的信誉凭证
+        """
+        task_id = task.get("task_id", task.get("id", ""))
+        leader_id = result.get("primary_id", "")
+        answer = result.get("answer", "")
+
+        # 收集本轮投票信息
+        votes = []
+        for replica in self.replicas.values():
+            if replica.agent.id == leader_id:
+                continue
+            # 从消息日志中获取 PREPARE 消息
+            seq = result.get("sequence_number", 0)
+            if seq in replica.message_log.prepare:
+                for prep_msg in replica.message_log.prepare[seq].values():
+                    votes.append({
+                        "voter_id": prep_msg.sender_id,
+                        "decision": prep_msg.decision,
+                        "confidence": prep_msg.confidence,
+                    })
+
+        # 获取正确答案（如果任务中有提供）
+        correct_answer = task.get("answer", task.get("correct_answer", None))
+
+        # === 1. 信誉更新 ===
+        if self.reputation_system:
+            print(f"\n[后处理] 更新信誉分数...")
+            updates = self.reputation_system.update_after_consensus(
+                task_id=task_id,
+                leader_id=leader_id,
+                leader_answer=answer,
+                votes=votes,
+                consensus_decision=result.get("decision", "Y"),
+                correct_answer=correct_answer,
+            )
+
+            # 打印信誉变更
+            for aid, u in updates.items():
+                if abs(u.delta) > 0.001:
+                    print(f"  {aid}: {u.old_reputation:.4f} -> {u.new_reputation:.4f} ({u.delta:+.4f}) [{u.reason}]")
+
+            # 同步到 Agent 对象
+            self.reputation_system.sync_to_agents(self.agents)
+
+            # 颁发信誉凭证
+            if self.did_registry:
+                for agent in self.agents:
+                    if agent.did:
+                        rep = self.reputation_system.get_reputation(agent.id)
+                        self.did_registry.issue_reputation_credential(
+                            did=agent.did,
+                            reputation_score=rep,
+                            total_tasks=agent.tasks_participated,
+                            success_rate=agent.tasks_success / max(1, agent.tasks_participated),
+                        )
+
+        # === 2. 激励分配 ===
+        if self.incentive_system:
+            print(f"\n[后处理] 分配激励奖励...")
+            voter_ids = [v["voter_id"] for v in votes]
+            rewards = self.incentive_system.distribute_consensus_rewards(
+                task_id=task_id,
+                leader_id=leader_id,
+                voter_ids=voter_ids,
+                success=result["success"],
+                leader_answer=answer,
+                correct_answer=correct_answer,
+            )
+
+        # === 3. 更新 Agent 任务统计 ===
+        for agent in self.agents:
+            agent.tasks_participated += 1
+            if result["success"]:
+                agent.tasks_success += 1
+
+        # === 4. 记录行为日志 ===
+        if self.behavior_log:
+            for agent in self.agents:
+                if agent.did:
+                    self.behavior_log.record_consensus_result(
+                        agent_id=agent.id,
+                        did=agent.did,
+                        task_id=task_id,
+                        success=result["success"],
+                        answer=answer,
+                    )
 
     def get_stats(self) -> Dict:
         """获取统计信息"""

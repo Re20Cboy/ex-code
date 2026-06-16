@@ -2,15 +2,20 @@
 Agentnode实现
 
 简化的Agent实现，支持Leader和Backup角色
+集成 DID 身份系统和行为追踪日志
 """
 
 import time
 import random
 from typing import Dict, List, Optional, Callable
 
+# DID 和行为日志模块
+from did_registry import DIDRegistry, DIDStatus
+from behavior_log import BehaviorLog, BehaviorEventType
+
 
 class Agent:
-    """单个Agentnode"""
+    """单个Agentnode（集成了DID身份）"""
 
     def __init__(
         self,
@@ -22,6 +27,8 @@ class Agent:
         role_config: Optional[Dict] = None,  # 专业领域角色配置
         malicious_peers: Optional[List[str]] = None,  # 恶意同伙列表
         malicious_answers_config: Optional[Dict] = None,  # 恶意节点的硬编码错误答案
+        did_registry: Optional[DIDRegistry] = None,  # DID注册表
+        behavior_log: Optional[BehaviorLog] = None,  # 行为日志
     ):
         """
         initAgent
@@ -35,6 +42,8 @@ class Agent:
             role_config: 专业领域角色配置（如：数学专家、逻辑分析师等）
             malicious_peers: 恶意同伙的ID列表（用于协同攻击）
             malicious_answers_config: 恶意节点的硬编码错误答案配置
+            did_registry: DID注册表实例（用于身份管理）
+            behavior_log: 行为日志实例（用于行为追踪）
         """
         self.id = agent_id
         self.role = role  # BFT协议角色：leader/backup
@@ -54,9 +63,56 @@ class Agent:
         # 恶意同伙列表（用于协同攻击）
         self.malicious_peers = malicious_peers or []
 
+        # === DID 身份系统 ===
+        self.did_registry = did_registry
+        self.behavior_log = behavior_log
+        self.did: Optional[str] = None  # 注册后填入
+
+        # === 信誉与激励相关 ===
+        self.voting_weight: float = 1.0  # 投票权重（由信誉系统计算）
+        self.total_rewards: float = 0.0   # 累计奖励
+        self.total_penalties: float = 0.0 # 累计惩罚
+        self.tasks_participated: int = 0  # 参与任务数
+        self.tasks_success: int = 0       # 成功任务数
+
         # 状态
         self.last_seen = time.time()
         self.message_queue = []
+
+    def register_did(self, stake_amount: float = None) -> str:
+        """
+        注册 DID 身份
+
+        Args:
+            stake_amount: 质押金额
+
+        Returns:
+            DID 标识符
+
+        Raises:
+            ValueError: 注册失败
+        """
+        if not self.did_registry:
+            raise ValueError("DID注册表未初始化")
+
+        did, doc = self.did_registry.register(
+            agent_id=self.id,
+            stake_amount=stake_amount,
+            specialty=self.specialty,
+            metadata={
+                "role_config": self.role_config.get("name", ""),
+                "is_malicious": self.is_malicious,  # 仅实验用，真实系统中不可见
+            },
+        )
+        self.did = did
+        return did
+
+    def is_did_active(self) -> bool:
+        """检查 DID 身份是否有效且活跃"""
+        if not self.did or not self.did_registry:
+            return False
+        valid, _ = self.did_registry.verify_identity(self.did)
+        return valid
 
     def propose(self, task: Dict) -> Dict:
         """
@@ -396,7 +452,8 @@ class Agent:
         }
 
     def __repr__(self):
-        return f"Agent({self.id}, role={self.role}, rep={self.reputation:.2f})"
+        did_str = f", did={self.did}" if self.did else ""
+        return f"Agent({self.id}, role={self.role}, rep={self.reputation:.2f}, weight={self.voting_weight:.2f}{did_str})"
 
 
 def create_agents(
@@ -405,9 +462,13 @@ def create_agents(
     llm_caller: Optional[Callable] = None,
     role_configs: Optional[List[Dict]] = None,
     random_assignment: bool = True,
+    did_registry: Optional[DIDRegistry] = None,
+    behavior_log: Optional[BehaviorLog] = None,
+    stake_amount: float = None,
+    malicious_answers_config: Optional[Dict] = None,
 ) -> List[Agent]:
     """
-    创建Agent列表
+    创建Agent列表（集成DID注册）
 
     Args:
         num_agents: Agent总数
@@ -415,6 +476,10 @@ def create_agents(
         llm_caller: LLM调用函数（所有agent共享同一个LLM）
         role_configs: 角色配置列表（可选）
         random_assignment: 是否随机分配角色（True=随机，False=按顺序）
+        did_registry: DID注册表实例（可选）
+        behavior_log: 行为日志实例（可选）
+        stake_amount: 质押金额（可选，默认使用注册表最低要求）
+        malicious_answers_config: 恶意节点答案配置
 
     Returns:
         Agent列表
@@ -455,7 +520,17 @@ def create_agents(
             llm_caller=llm_caller,
             role_config=assigned_roles[i],  # 分配角色配置
             malicious_peers=[],  # 先设置为空列表，稍后填充
+            malicious_answers_config=malicious_answers_config if is_malicious else {},
+            did_registry=did_registry,
+            behavior_log=behavior_log,
         )
+
+        # === DID 注册 ===
+        if did_registry:
+            try:
+                agent.register_did(stake_amount=stake_amount)
+            except ValueError as e:
+                print(f"[WARNING] Agent {agent_id} DID注册失败: {e}")
 
         agents.append(agent)
 

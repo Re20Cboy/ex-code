@@ -139,6 +139,37 @@ CONFIG = {
     "output_dir": "data/results",
     "save_intermediate": True,
     "random_seed": 42,
+
+    # === DID 身份系统配置 ===
+    "did": {
+        "enabled": True,                # 是否启用 DID 系统
+        "min_stake": 100.0,             # 最低质押金额
+        "stake_amount": 200.0,          # 默认质押金额
+        "stake_slash_ratio": 0.5,       # 罚没质押比例
+    },
+
+    # === 信誉系统配置 ===
+    "reputation": {
+        "enabled": True,                # 是否启用信誉系统
+        "alpha": 0.05,                  # 奖励系数
+        "beta": 0.3,                    # 惩罚系数（beta >> alpha，严打恶意）
+        "decay_factor": 0.995,          # 自然衰减因子
+        "suspend_threshold": 0.3,       # DID 暂停阈值
+        "revoke_threshold": 0.1,        # DID 吊销阈值
+    },
+
+    # === 激励系统配置 ===
+    "incentive": {
+        "enabled": True,                # 是否启用激励系统
+        "initial_pool": 10000.0,        # 初始激励池金额
+        "base_proposal_reward": 10.0,   # Leader 基础提案奖励
+        "base_validation_reward": 5.0,  # Backup 基础验证奖励
+    },
+
+    # === 加权投票配置 ===
+    "weighted_voting": {
+        "enabled": True,                # 是否启用加权投票
+    },
 }
 
 
